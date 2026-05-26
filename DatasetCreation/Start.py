@@ -6,6 +6,20 @@ import sys
 from pathlib import Path
 from time import sleep, time
 
+from bootstrap import prime_and_prepare, prime_imports
+
+prime_and_prepare(__file__)
+
+from dataset_paths import (
+    capture_dir,
+    data_output_dir,
+    dataset_root,
+    pythonpath_env,
+    testing_dir,
+    venv_site_packages,
+    world_dir,
+)
+
 # Only one of these runs; others are excluded from the auto-launch list.
 RADAR_SETUP_SCRIPTS = frozenset(
     {
@@ -56,12 +70,24 @@ TEST_MODE_SCRIPTS_AFTER_SETUP = (
 )
 
 
+def script_path(dc_root: Path, name: str) -> Path:
+    if name in RADAR_SETUP_SCRIPTS:
+        return dc_root / "setup" / name
+    if name in ("CaptureRadarCameraData.py", "ExportRadarExtrinsics.py", "ExportCameraExtrinsics.py"):
+        return dc_root / "capture" / name
+    if name in ("TestRadarLabeling.py", "RadarLabelingTestReport.py"):
+        return dc_root / "testing" / name
+    if name in ("FetchActorSizing.py", "PrintRadarLayoutExtrinsics.py"):
+        return dc_root / "tools" / name
+    return dc_root / "world" / name
+
+
 def prompt_radar_count() -> int:
     print("How many radars should the dataset use?")
-    print("  1) 4   -> RadarCameraSetup4.py")
-    print("  2) 8   -> RadarCameraSetup8.py")
-    print("  3) 12  -> RadarCameraSetup12.py")
-    print("  For 14 -> RadarCameraSetup14.py: type 14 at the prompt.")
+    print("  1) 4   -> setup/RadarCameraSetup4.py")
+    print("  2) 8   -> setup/RadarCameraSetup8.py")
+    print("  3) 12  -> setup/RadarCameraSetup12.py")
+    print("  For 14 -> setup/RadarCameraSetup14.py: type 14 at the prompt.")
     print("Enter menu 1-3, or type the radar count: 4, 8, 12, or 14.")
     allowed = frozenset({4, 8, 12, 14})
     menu = {"1": 4, "2": 8, "3": 12}
@@ -80,10 +106,10 @@ def prompt_radar_count() -> int:
 
 def prompt_run_mode() -> str:
     print("\nRun mode:")
-    print("  1) Full dataset pipeline (all scripts + CaptureRadarCameraData.py)")
+    print("  1) Full dataset pipeline (all scripts + capture/CaptureRadarCameraData.py)")
     print(
         "  2) Test radar labeling only "
-        "(setup + spawn cars/pedestrians + TestRadarLabeling.py)"
+        "(setup + spawn cars/pedestrians + testing/TestRadarLabeling.py)"
     )
     while True:
         choice = input("Choice (default 1): ").strip() or "1"
@@ -112,77 +138,51 @@ def parse_cli_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def get_scripts_to_start(directory: Path, radar_setup_filename: str) -> list[Path]:
-    """Return sorted Python scripts in this directory, excluding this file."""
-    this_file = Path(__file__).resolve()
-    # Export* scripts are run from the Ctrl+C handler, not as parallel children.
-    excluded_scripts = {
-        "DespawnAllCars.py",
-        "ExportRadarExtrinsics.py",
-        "ExportCameraExtrinsics.py",
-    } | MANUAL_ONLY_SCRIPTS
-    scripts = []
-    for script in directory.glob("*.py"):
-        if script.resolve() == this_file:
-            continue
-        if script.name in excluded_scripts:
-            continue
-        if script.name in RADAR_SETUP_SCRIPTS:
-            continue
-        scripts.append(script)
-    sorted_scripts = sorted(scripts, key=lambda path: path.name.lower())
-    by_name = {s.name: s for s in sorted_scripts}
-
-    setup_path = directory / radar_setup_filename
-    if not setup_path.exists():
+def get_scripts_to_start(dc_root: Path, radar_setup_filename: str) -> list[Path]:
+    setup_path = script_path(dc_root, radar_setup_filename)
+    if not setup_path.is_file():
         raise FileNotFoundError(f"Radar setup script not found: {setup_path}")
 
-    preferred_last = {"CaptureRadarCameraData.py"}
-    ordered_middle: list[Path] = []
-    used = set()
+    ordered_middle = [script_path(dc_root, name) for name in FULL_PIPELINE_MIDDLE_SCRIPTS]
+    missing = [p for p in ordered_middle if not p.is_file()]
+    if missing:
+        raise FileNotFoundError(f"Pipeline script not found: {missing[0]}")
 
-    for name in FULL_PIPELINE_MIDDLE_SCRIPTS:
-        path = by_name.get(name)
-        if path is not None:
-            ordered_middle.append(path)
-            used.add(name)
+    capture_path = script_path(dc_root, "CaptureRadarCameraData.py")
+    if not capture_path.is_file():
+        raise FileNotFoundError(f"Capture script not found: {capture_path}")
 
-    for script in sorted_scripts:
-        if script.name in preferred_last or script.name in used:
-            continue
-        ordered_middle.append(script)
-
-    last = [by_name[name] for name in preferred_last if name in by_name]
-    return [setup_path] + ordered_middle + last
+    return [setup_path, *ordered_middle, capture_path]
 
 
-def get_scripts_for_test_mode(directory: Path, radar_setup_filename: str) -> list[Path]:
+def get_scripts_for_test_mode(dc_root: Path, radar_setup_filename: str) -> list[Path]:
     """Minimal stack to validate radar labeling (vehicles + pedestrians)."""
-    setup_path = directory / radar_setup_filename
-    if not setup_path.exists():
+    setup_path = script_path(dc_root, radar_setup_filename)
+    if not setup_path.is_file():
         raise FileNotFoundError(f"Radar setup script not found: {setup_path}")
 
     scripts = [setup_path]
     for name in TEST_MODE_SCRIPTS_AFTER_SETUP:
-        path = directory / name
-        if not path.exists():
+        path = script_path(dc_root, name)
+        if not path.is_file():
             raise FileNotFoundError(f"Test mode script not found: {path}")
         scripts.append(path)
     return scripts
 
 
-def resolve_dataset_export_dir(script_dir: Path) -> Path | None:
+def resolve_dataset_export_dir(dc_root: Path) -> Path | None:
     """
-    Active capture run from .last_dataset_capture_dir (written by CaptureRadarCameraData.py),
-    else the newest sensor_capture_* that has both radar and camera metadata CSVs.
+    Active capture run from capture/.last_dataset_capture_dir (written by CaptureRadarCameraData.py),
+    else the newest sensor_capture_* under Data/ with both radar and camera metadata CSVs.
     """
-    pointer = script_dir / ".last_dataset_capture_dir"
+    cap = capture_dir(dc_root)
+    pointer = cap / ".last_dataset_capture_dir"
     if pointer.is_file():
         try:
             raw = pointer.read_text(encoding="utf-8").strip()
             p = Path(raw)
             if not p.is_absolute():
-                p = (script_dir / p).resolve()
+                p = (cap / p).resolve()
             else:
                 p = p.resolve()
             if (
@@ -193,9 +193,12 @@ def resolve_dataset_export_dir(script_dir: Path) -> Path | None:
                 return p
         except OSError:
             pass
+    data_root = data_output_dir(dc_root)
+    if not data_root.is_dir():
+        return None
     candidates = [
         p
-        for p in script_dir.glob("sensor_capture_*")
+        for p in data_root.glob("sensor_capture_*")
         if p.is_dir()
         and (p / "radar_data.csv").exists()
         and (p / "camera_data.csv").exists()
@@ -211,8 +214,8 @@ TEST_LABELING_WAIT_S = 120.0
 LIVE_STATS_POLL_INTERVAL_S = 2.0
 
 
-def resolve_last_test_output_dir(script_dir: Path) -> Path | None:
-    pointer = script_dir / ".last_radar_labeling_test_dir"
+def resolve_last_test_output_dir(dc_root: Path) -> Path | None:
+    pointer = testing_dir(dc_root) / ".last_radar_labeling_test_dir"
     if not pointer.is_file():
         return None
     raw = pointer.read_text(encoding="utf-8").strip()
@@ -220,7 +223,7 @@ def resolve_last_test_output_dir(script_dir: Path) -> Path | None:
         return None
     path = Path(raw)
     if not path.is_absolute():
-        path = (script_dir / path).resolve()
+        path = (testing_dir(dc_root) / path).resolve()
     return path if path.is_dir() else None
 
 
@@ -229,18 +232,21 @@ def format_live_stats_console_line(data: dict) -> str:
     rate_c = data.get("match_rate_given_candidates", 0.0)
     return (
         "[LiveStats] "
+        f"msgs={data.get('radar_messages', 0):,} "
+        f"raw={data.get('raw_radar_returns', 0):,} | "
         f"scored={data.get('total_detections', 0):,} | "
         f"matched={data.get('matched_detections', 0):,} | "
         f"w/ candidates={wc:,} → {100 * rate_c:.1f}% | "
+        f"q={data.get('queue_pending', 0)} drop={data.get('queue_dropped', 0)} | "
         f"updated={data.get('updated_at', '?')} (#{data.get('seq', 0)})"
     )
 
 
 def tick_live_stats_display(
-    script_dir: Path, last_key: tuple[int, str] | None
+    dc_root: Path, last_key: tuple[int, str] | None
 ) -> tuple[int, str] | None:
     """Print when live_stats.json changes (polled from Start.py)."""
-    out_dir = resolve_last_test_output_dir(script_dir)
+    out_dir = resolve_last_test_output_dir(dc_root)
     if out_dir is None:
         return last_key
     path = out_dir / "live_stats.json"
@@ -257,8 +263,8 @@ def tick_live_stats_display(
     return key
 
 
-def request_test_labeling_stop(script_dir: Path) -> Path | None:
-    out_dir = resolve_last_test_output_dir(script_dir)
+def request_test_labeling_stop(dc_root: Path) -> Path | None:
+    out_dir = resolve_last_test_output_dir(dc_root)
     if out_dir is None:
         return None
     (out_dir / REQUEST_STOP_FILENAME).write_text("", encoding="utf-8")
@@ -339,12 +345,10 @@ def stop_all(processes: list[subprocess.Popen], timeout_s: float = 5.0) -> None:
 
     print("\nStopping all scripts...")
 
-    # First ask each script to terminate gracefully.
     for process in processes:
         if process.poll() is None:
             process.terminate()
 
-    # Wait briefly for graceful exits.
     for process in processes:
         if process.poll() is not None:
             continue
@@ -353,7 +357,6 @@ def stop_all(processes: list[subprocess.Popen], timeout_s: float = 5.0) -> None:
         except subprocess.TimeoutExpired:
             pass
 
-    # Force kill any script still running after timeout.
     for process in processes:
         if process.poll() is None:
             print(f"  - Force killing PID {process.pid}")
@@ -363,29 +366,26 @@ def stop_all(processes: list[subprocess.Popen], timeout_s: float = 5.0) -> None:
     print("All scripts stopped.")
 
 
-def export_dataset_extrinsics_in_process(
-    script_dir: Path, dataset_dir: Path | None
-) -> None:
+def export_dataset_extrinsics_in_process(dc_root: Path, dataset_dir: Path | None) -> None:
     """
     Same in-process path as CaptureRadarCameraData: avoids spawning python.exe, which
     often failed to import `carla` and produced no extrinsic files.
     """
     target = dataset_dir
     if target is None:
-        target = resolve_dataset_export_dir(script_dir)
+        target = resolve_dataset_export_dir(dc_root)
     if target is None:
         print(
-            "No capture folder found for extrinsics (need sensor_capture_* with both CSVs).",
+            "No capture folder found for extrinsics (need sensor_capture_* with both CSVs under Data/).",
             file=sys.stderr,
         )
         return
-    sd = str(script_dir)
-    if sd not in sys.path:
-        sys.path.insert(0, sd)
+    cap = capture_dir(dc_root)
+    prime_imports(dc_root)
     try:
-        import carla
-        from ExportCameraExtrinsics import write_camera_extrinsics_to_dataset_dir
-        from ExportRadarExtrinsics import write_radar_extrinsics_live_to_dataset_dir
+        from carla_connect import get_world
+        from capture.ExportCameraExtrinsics import write_camera_extrinsics_to_dataset_dir
+        from capture.ExportRadarExtrinsics import write_radar_extrinsics_live_to_dataset_dir
     except ImportError as e:
         print(f"Extrinsics: could not import CARLA/export modules: {e}", file=sys.stderr)
         return
@@ -395,19 +395,17 @@ def export_dataset_extrinsics_in_process(
         flush=True,
     )
     try:
-        client = carla.Client("localhost", 2000)
-        client.set_timeout(10.0)
-        world = client.get_world()
+        client, world = get_world()
         write_camera_extrinsics_to_dataset_dir(world, target)
         write_radar_extrinsics_live_to_dataset_dir(world, target)
     except Exception as e:  # noqa: BLE001
         print(f"Extrinsics export error: {e}", file=sys.stderr)
 
 
-def despawn_all_cars(script_dir: Path) -> None:
+def despawn_all_cars(dc_root: Path) -> None:
     """Run the dedicated car-despawn script."""
-    despawn_script = script_dir / "DespawnAllCars.py"
-    if not despawn_script.exists():
+    despawn_script = world_dir(dc_root) / "DespawnAllCars.py"
+    if not despawn_script.is_file():
         print(f"Despawn script not found: {despawn_script}")
         return
 
@@ -415,7 +413,8 @@ def despawn_all_cars(script_dir: Path) -> None:
     completed = subprocess.run(
         [sys.executable, str(despawn_script)],
         check=False,
-        cwd=str(script_dir),
+        cwd=str(dc_root),
+        env={**os.environ, "PYTHONPATH": pythonpath_env(dc_root)},
     )
     if completed.returncode == 0:
         print("Car despawn completed.")
@@ -425,19 +424,22 @@ def despawn_all_cars(script_dir: Path) -> None:
 
 def launch_scripts(
     scripts: list[Path],
-    current_dir: Path,
+    dc_root: Path,
     child_env: dict[str, str],
     *,
     test_mode: bool,
 ) -> list[subprocess.Popen]:
     processes: list[subprocess.Popen] = []
     for script in scripts:
-        print(f"  - {script.name}")
+        try:
+            rel = script.relative_to(dc_root)
+        except ValueError:
+            rel = script
+        print(f"  - {rel}")
         popen_kwargs: dict = {
             "env": child_env,
-            "cwd": str(current_dir),
+            "cwd": str(dc_root),
         }
-        # Tk GUI in its own console on Windows so it stays visible beside Start.py.
         if script.name == "TrafficLightControl.py" and sys.platform == "win32":
             popen_kwargs["creationflags"] = subprocess.CREATE_NEW_CONSOLE
         process = subprocess.Popen(
@@ -460,41 +462,149 @@ def launch_scripts(
     return processes
 
 
+def ensure_carla_importable(dc_root: Path) -> None:
+    """Fail fast with a clear message if child scripts cannot import carla."""
+    probe_env = os.environ.copy()
+    probe_env["PYTHONPATH"] = pythonpath_env(dc_root)
+    result = subprocess.run(
+        [sys.executable, "-c", "import carla"],
+        env=probe_env,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode == 0:
+        return
+
+    venv_sp = venv_site_packages(dc_root)
+    lines = [
+        "CARLA Python API is not available to child scripts.",
+        f"  Interpreter: {sys.executable}",
+    ]
+    if venv_sp is not None:
+        lines.append(f"  Found project venv packages at: {venv_sp}")
+        lines.append(
+            "  Your .venv may be broken (pyvenv.cfg points at a missing Python). "
+            "Recreate it, reinstall carla, then activate before running Start.py."
+        )
+    else:
+        lines.append(
+            "  Install the CARLA egg/wheel for your Python version, or create a project .venv "
+            "with carla installed."
+        )
+    if result.stderr.strip():
+        lines.append(f"  Import error: {result.stderr.strip()}")
+    raise SystemExit("\n".join(lines))
+
+
+def wait_for_carla_ready(dc_root: Path) -> None:
+    """Do not launch child scripts until the simulator responds."""
+    prime_imports(dc_root)
+    from carla_connect import carla_host, carla_port, wait_for_simulator
+
+    print(
+        f"Waiting for CARLA at {carla_host()}:{carla_port()} "
+        "(start the simulator if it is not running)...",
+        flush=True,
+    )
+    _, world = wait_for_simulator()
+    print(f"CARLA ready — map: {world.get_map().name}", flush=True)
+
+
+def _resolve_last_capture_dir(dc_root: Path) -> Path | None:
+    """Return the active capture run directory from the .last_dataset_capture_dir pointer."""
+    pointer = capture_dir(dc_root) / ".last_dataset_capture_dir"
+    try:
+        raw = pointer.read_text(encoding="utf-8").strip()
+        p = Path(raw)
+        if not p.is_absolute():
+            p = (capture_dir(dc_root) / p).resolve()
+        if p.is_dir():
+            return p
+    except OSError:
+        pass
+    return None
+
+
+def _estimate_capture_wait_s(dc_root: Path) -> float:
+    """Compute a shutdown wait budget that covers offline radar labeling.
+
+    Strategy: inspect radar_data.csv file size, divide by a conservative
+    bytes-per-second throughput to get an estimated labeling duration, then
+    add fixed overhead (drain + extrinsics) and a 50 % safety margin.
+    Falls back to a generous fixed value if the file can't be found.
+    """
+    # Fixed overhead: drain queue (≤30s) + extrinsics export + actor-frames load.
+    OVERHEAD_S = 120.0
+    # Conservative labeling throughput observed in practice: ~3 000 rows/s.
+    # Each radar CSV row is roughly 200 bytes → ~600 kB/s.
+    BYTES_PER_SECOND = 600_000.0
+    SAFETY_FACTOR = 1.5
+    MIN_WAIT_S = 300.0   # Never less than 5 min (covers small captures).
+    MAX_WAIT_S = 7200.0  # Cap at 2 h to avoid hanging indefinitely.
+
+    run_dir = _resolve_last_capture_dir(dc_root)
+    if run_dir is not None:
+        radar_csv = run_dir / "radar_data.csv"
+        try:
+            size_bytes = radar_csv.stat().st_size
+            estimated_label_s = size_bytes / BYTES_PER_SECOND * SAFETY_FACTOR
+            total = OVERHEAD_S + estimated_label_s
+            wait_s = max(MIN_WAIT_S, min(total, MAX_WAIT_S))
+            print(
+                f"[shutdown] radar_data.csv is {size_bytes / 1e6:.1f} MB → "
+                f"estimated labeling wait: {wait_s:.0f}s",
+                flush=True,
+            )
+            return wait_s
+        except OSError:
+            pass
+
+    return max(MIN_WAIT_S, OVERHEAD_S)
+
+
 def main() -> None:
     cli = parse_cli_args()
-    current_dir = Path(__file__).resolve().parent
+    dc_root = dataset_root()
+    prime_imports(dc_root)
+    ensure_carla_importable(dc_root)
 
     radar_count = cli.radar_count if cli.radar_count is not None else prompt_radar_count()
     run_mode = "test" if cli.test_labeling else prompt_run_mode()
     radar_setup_name = RADAR_COUNT_TO_SETUP[radar_count]
 
     if run_mode == "test":
-        scripts = get_scripts_for_test_mode(current_dir, radar_setup_name)
+        scripts = get_scripts_for_test_mode(dc_root, radar_setup_name)
     else:
-        scripts = get_scripts_to_start(current_dir, radar_setup_name)
+        scripts = get_scripts_to_start(dc_root, radar_setup_name)
 
     if not scripts:
         print("No scripts found to start.")
         return
 
     test_mode = run_mode == "test"
+    data_dir = data_output_dir(dc_root)
+    data_dir.mkdir(parents=True, exist_ok=True)
+
     child_env = os.environ.copy()
+    child_env["PYTHONPATH"] = pythonpath_env(dc_root)
+    child_env["DATASET_CARLA_HOST"] = os.environ.get("DATASET_CARLA_HOST", "127.0.0.1")
+    child_env["DATASET_CARLA_TIMEOUT_S"] = os.environ.get("DATASET_CARLA_TIMEOUT_S", "60")
     child_env["DATASET_EXPECTED_RADAR_COUNT"] = str(radar_count)
     child_env["DATASET_PEDESTRIAN_COUNT"] = str(DEFAULT_PEDESTRIAN_COUNT)
+    child_env["DATASET_CAPTURE_BASE_DIR"] = str(data_dir)
     child_env["DATASET_KEEP_PEDESTRIANS_RUNNING"] = "1"
     child_env["DATASET_KEEP_TRAFFIC_RUNNING"] = "1"
     child_env["DATASET_FREE_VEHICLE_DRIVING"] = "1"
-    # Legacy perimeter cycling (proven); set DATASET_AUTOMATIC_TRAFFIC_LIGHTS=1 to unfreeze all.
     child_env["DATASET_AUTOMATIC_TRAFFIC_LIGHTS"] = "0"
     child_env["DATASET_TRAFFIC_LIGHT_GUI_AUTOCONNECT"] = "1"
     if test_mode:
-        # Prevent RadarCameraSetup from exiting on Enter (shared console with TestRadarLabeling).
         child_env["DATASET_KEEP_SENSORS_RUNNING"] = "1"
     mode_label = "TEST (radar labeling)" if test_mode else "FULL dataset"
 
     print(f"Mode: {mode_label}")
-    print(f"Radar layout: {radar_count} sensors via {radar_setup_name}")
-    print(f"Starting {len(scripts)} scripts from {current_dir}:")
+    print(f"Radar layout: {radar_count} sensors via setup/{radar_setup_name}")
+    print(f"Dataset output: {data_dir}")
+    print(f"Starting {len(scripts)} scripts from {dc_root}:")
     if test_mode:
         print(
             "Radar test: [RadarTest] + [LiveStats] every ~2s (live_stats.json); "
@@ -505,14 +615,16 @@ def main() -> None:
         print(
             "Traffic: TrafficLightSetup (perimeter lights cycle) + TrafficLightControl GUI "
             "(auto-connects). Free-roaming TM vehicles and navmesh pedestrians. "
-            "On stop: extrinsics + radar_labeling_qa/ under sensor_capture_*."
+            "On stop: extrinsics + radar_labeling_qa/ under Data/sensor_capture_*."
         )
         print(
             "On Ctrl+C: camera + radar extrinsics are exported into the active sensor_capture_* folder, "
             "then scripts stop. Keep CARLA running until you see the export messages."
         )
 
-    processes = launch_scripts(scripts, current_dir, child_env, test_mode=test_mode)
+    wait_for_carla_ready(dc_root)
+
+    processes = launch_scripts(scripts, dc_root, child_env, test_mode=test_mode)
 
     print("All scripts started. Press Ctrl+C to stop all.")
 
@@ -524,12 +636,12 @@ def main() -> None:
             if is_test_mode:
                 now = time()
                 if now - last_live_poll >= LIVE_STATS_POLL_INTERVAL_S:
-                    live_stats_key = tick_live_stats_display(current_dir, live_stats_key)
+                    live_stats_key = tick_live_stats_display(dc_root, live_stats_key)
                     last_live_poll = now
             sleep(0.25)
     except KeyboardInterrupt:
         if is_test_mode:
-            out_dir = request_test_labeling_stop(current_dir)
+            out_dir = request_test_labeling_stop(dc_root)
             if out_dir is not None:
                 print(
                     f"\nRequested TestRadarLabeling to stop and save to:\n  {out_dir}",
@@ -563,17 +675,55 @@ def main() -> None:
                     print_test_labeling_summaries(out_dir)
             stop_all(processes, timeout_s=12.0)
         else:
-            export_dir = resolve_dataset_export_dir(current_dir)
-            if export_dir is not None:
-                print(f"Target capture folder for extrinsics: {export_dir}")
-            else:
+            # CaptureRadarCameraData.py also received CTRL_C from the console and is
+            # already running its finally block: drain radar queue (up to 30s) →
+            # export extrinsics → stop sensors → run offline labeling
+            # (LabelRadarCapture.label_radar_capture_dir, ~10-30s on a long run).
+            # We MUST wait for it to exit on its own — calling stop_all() right away
+            # would TerminateProcess it on Windows and skip the offline labeling step,
+            # which is exactly the bug that left captures with no radar_data_labeled.csv.
+            capture_proc = next(
+                (
+                    p
+                    for p in processes
+                    if p.args and "CaptureRadarCameraData" in str(p.args[-1])
+                ),
+                None,
+            )
+            if capture_proc is not None and capture_proc.poll() is None:
+                capture_wait_s = _estimate_capture_wait_s(dc_root)
                 print(
-                    "No capture folder with radar_data.csv + camera_data.csv found; "
-                    "extrinsics will try each script's default (latest) path."
+                    "\nWaiting for CaptureRadarCameraData to finish "
+                    "(drain queue + extrinsics + offline labeling). "
+                    f"Up to {capture_wait_s:.0f}s — DO NOT close this window.",
+                    flush=True,
                 )
-            export_dataset_extrinsics_in_process(current_dir, export_dir)
+                try:
+                    capture_proc.wait(timeout=capture_wait_s)
+                    print(
+                        "Capture process exited cleanly. "
+                        "Check the run folder for radar_data_labeled.csv.",
+                        flush=True,
+                    )
+                except subprocess.TimeoutExpired:
+                    run_dir = _resolve_last_capture_dir(dc_root)
+                    hint = (
+                        f"--capture-dir \"{run_dir}\""
+                        if run_dir
+                        else "--capture-dir <run folder>"
+                    )
+                    print(
+                        f"Capture still running after {capture_wait_s:.0f}s; "
+                        "terminating. If radar_data_labeled.csv is missing, run:\n"
+                        f"  python -m capture.LabelRadarCapture {hint}",
+                        flush=True,
+                    )
+            # Capture handles its own extrinsics export in its finally block while
+            # sensors are still alive in the world, so we no longer call
+            # export_dataset_extrinsics_in_process here — by the time we got to it,
+            # RadarCameraSetup* had already destroyed the sensors and the call failed.
             stop_all(processes)
-        despawn_all_cars(current_dir)
+        despawn_all_cars(dc_root)
 
 
 if __name__ == "__main__":
